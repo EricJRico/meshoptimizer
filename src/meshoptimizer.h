@@ -440,14 +440,17 @@ MESHOPTIMIZER_API size_t meshopt_simplifyWithAttributes(unsigned int* destinatio
 MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifySloppy(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t target_index_count, float target_error, float* result_error);
 
 /**
- * Experimental: Mesh simplifier (sloppy) with vertex locks
- * Same as meshopt_simplifySloppy, but vertices with vertex_lock[i] != 0 are never merged into a
- * grid cell with any other vertex: each locked vertex survives in the output at its original
- * position. Unlocked vertices cluster exactly as they would in meshopt_simplifySloppy.
+ * Experimental: Mesh simplifier (sloppy) with per-vertex density weights
+ * Same as meshopt_simplifySloppy, but weighted vertices are clustered on a finer local grid so
+ * painted regions keep more detail: weight 0 clusters on the base grid, 1..127 on a 2x finer
+ * grid, 128..254 on a 4x finer grid, and 255 pins the vertex (never merged, survives verbatim).
+ * The grid size is chosen ignoring weights, so unweighted regions decimate exactly as in
+ * meshopt_simplifySloppy and the weighted regions' extra vertices ride on top of the target —
+ * the result can exceed target_index_count by the retained detail.
  *
- * vertex_lock can be NULL; if it is not NULL, it should have a value for each vertex; 1 denotes vertices that can't be moved
+ * vertex_weight can be NULL, in which case the behavior is identical to meshopt_simplifySloppy.
  */
-MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifySloppyWithLocks(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* result_error);
+MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifySloppyWithWeights(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_weight, size_t target_index_count, float target_error, float* result_error);
 
 /**
  * Experimental: Mesh simplifier (pruner)

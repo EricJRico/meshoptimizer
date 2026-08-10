@@ -1588,7 +1588,12 @@ struct TriangleHasher
 	}
 };
 
-static void computeVertexIds(unsigned int* vertex_ids, const Vector3* vertex_positions, const unsigned char* vertex_lock, size_t vertex_count, int grid_size)
+// vertex_weight semantics (meshopt_simplifySloppyWithWeights): 0 = cluster on the base grid;
+// 1..127 = cluster on a 2x finer local grid; 128..254 = 4x finer; 255 = never merge (pinned).
+// The top 2 id bits carry the weight level so cells never span levels; grid coordinates use
+// bits 0..29 (10 per axis, clamped so finer scales can't overflow), pinned ids carry the
+// vertex index instead of coordinates.
+static void computeVertexIds(unsigned int* vertex_ids, const Vector3* vertex_positions, const unsigned char* vertex_weight, size_t vertex_count, int grid_size)
 {
 	assert(grid_size >= 1 && grid_size <= 1024);
 	float cell_scale = float(grid_size - 1);
@@ -1596,13 +1601,23 @@ static void computeVertexIds(unsigned int* vertex_ids, const Vector3* vertex_pos
 	for (size_t i = 0; i < vertex_count; ++i)
 	{
 		const Vector3& v = vertex_positions[i];
+		unsigned char w = vertex_weight ? vertex_weight[i] : 0;
 
-		int xi = int(v.x * cell_scale + 0.5f);
-		int yi = int(v.y * cell_scale + 0.5f);
-		int zi = int(v.z * cell_scale + 0.5f);
+		if (w == 255)
+		{
+			vertex_ids[i] = 0xC0000000u | unsigned(i);
+			continue;
+		}
 
-		// locked vertices get a unique id (grid ids use bits 0..29) so they never merge with any other vertex
-		vertex_ids[i] = (vertex_lock && vertex_lock[i]) ? (0x80000000u | unsigned(i)) : unsigned((xi << 20) | (yi << 10) | zi);
+		unsigned int level = (w == 0) ? 0 : (w < 128 ? 1 : 2);
+		float scale = cell_scale * float(1 << level);
+		scale = scale > 1023.f ? 1023.f : scale;
+
+		int xi = int(v.x * scale + 0.5f);
+		int yi = int(v.y * scale + 0.5f);
+		int zi = int(v.z * scale + 0.5f);
+
+		vertex_ids[i] = (level << 30) | unsigned((xi << 20) | (yi << 10) | zi);
 	}
 }
 
@@ -2099,7 +2114,7 @@ size_t meshopt_simplifyWithAttributes(unsigned int* destination, const unsigned 
 	return meshopt_simplifyEdge(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_attributes_data, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, out_result_error);
 }
 
-static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* out_result_error)
+static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_weight, size_t target_index_count, float target_error, float* out_result_error)
 {
 	using namespace meshopt;
 
@@ -2133,10 +2148,12 @@ static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* 
 	size_t max_triangles = index_count / 3;
 
 	// when we're error-limited, we compute the triangle count for the min. size; this accelerates convergence and provides the correct answer when we can't use a larger grid
-	// with locks the coarsest grid can still retain triangles between locked vertices, so the count must be measured there as well — otherwise a lock-dominated result is misreported as fully collapsed
-	if (min_grid > 1 || vertex_lock)
+	// note: the grid search deliberately ignores vertex_weight — the grid is chosen as if the mesh
+	// were unweighted, so unweighted regions decimate exactly as in meshopt_simplifySloppy and the
+	// weighted regions' extra vertices ride ON TOP of the target count
+	if (min_grid > 1)
 	{
-		computeVertexIds(vertex_ids, vertex_positions, vertex_lock, vertex_count, min_grid);
+		computeVertexIds(vertex_ids, vertex_positions, NULL, vertex_count, min_grid);
 		min_triangles = countTriangles(vertex_ids, indices, index_count);
 	}
 
@@ -2152,7 +2169,7 @@ static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* 
 		int grid_size = next_grid_size;
 		grid_size = (grid_size <= min_grid) ? min_grid + 1 : (grid_size >= max_grid ? max_grid - 1 : grid_size);
 
-		computeVertexIds(vertex_ids, vertex_positions, vertex_lock, vertex_count, grid_size);
+		computeVertexIds(vertex_ids, vertex_positions, NULL, vertex_count, grid_size);
 		size_t triangles = countTriangles(vertex_ids, indices, index_count);
 
 #if TRACE
@@ -2180,7 +2197,7 @@ static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* 
 		next_grid_size = (pass < kInterpolationPasses) ? int(tip + 0.5f) : (min_grid + max_grid) / 2;
 	}
 
-	if (min_triangles == 0)
+	if (min_triangles == 0 && !vertex_weight)
 	{
 		if (out_result_error)
 			*out_result_error = 1.f;
@@ -2189,12 +2206,24 @@ static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* 
 	}
 
 	// build vertex->cell association by mapping all vertices with the same quantized position to the same cell
+	// the final clustering DOES honor vertex_weight: weighted vertices land on finer local grids
+	// (or pinned cells), so the retained triangle count can exceed min_triangles from the search
 	size_t table_size = hashBuckets2(vertex_count);
 	unsigned int* table = allocator.allocate<unsigned int>(table_size);
 
 	unsigned int* vertex_cells = allocator.allocate<unsigned int>(vertex_count);
 
-	computeVertexIds(vertex_ids, vertex_positions, vertex_lock, vertex_count, min_grid);
+	computeVertexIds(vertex_ids, vertex_positions, vertex_weight, vertex_count, min_grid);
+	size_t final_triangles = vertex_weight ? countTriangles(vertex_ids, indices, index_count) : min_triangles;
+
+	if (final_triangles == 0)
+	{
+		if (out_result_error)
+			*out_result_error = 1.f;
+
+		return 0;
+	}
+
 	size_t cell_count = fillVertexCells(table, table_size, vertex_cells, vertex_ids, vertex_count);
 
 	// build a quadric for each target cell
@@ -2217,7 +2246,8 @@ static size_t simplifySloppyImpl(unsigned int* destination, const unsigned int* 
 
 	// collapse triangles!
 	// note that we need to filter out triangles that we've already output because we very frequently generate redundant triangles between cells :(
-	size_t tritable_size = hashBuckets2(min_triangles);
+	// the table must be sized for the weight-aware count — with weights it can exceed min_triangles
+	size_t tritable_size = hashBuckets2(final_triangles);
 	unsigned int* tritable = allocator.allocate<unsigned int>(tritable_size);
 
 	size_t write = filterTriangles(destination, tritable, tritable_size, indices, index_count, vertex_cells, cell_remap);
@@ -2237,9 +2267,9 @@ size_t meshopt_simplifySloppy(unsigned int* destination, const unsigned int* ind
 	return simplifySloppyImpl(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, NULL, target_index_count, target_error, out_result_error);
 }
 
-size_t meshopt_simplifySloppyWithLocks(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* out_result_error)
+size_t meshopt_simplifySloppyWithWeights(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_weight, size_t target_index_count, float target_error, float* out_result_error)
 {
-	return simplifySloppyImpl(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_lock, target_index_count, target_error, out_result_error);
+	return simplifySloppyImpl(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_weight, target_index_count, target_error, out_result_error);
 }
 
 size_t meshopt_simplifyPrune(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, float target_error)
