@@ -440,6 +440,16 @@ MESHOPTIMIZER_API size_t meshopt_simplifyWithAttributes(unsigned int* destinatio
 MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifySloppy(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t target_index_count, float target_error, float* result_error);
 
 /**
+ * Experimental: Mesh simplifier (sloppy) with vertex locks
+ * Same as meshopt_simplifySloppy, but vertices with vertex_lock[i] != 0 are never merged into a
+ * grid cell with any other vertex: each locked vertex survives in the output at its original
+ * position. Unlocked vertices cluster exactly as they would in meshopt_simplifySloppy.
+ *
+ * vertex_lock can be NULL; if it is not NULL, it should have a value for each vertex; 1 denotes vertices that can't be moved
+ */
+MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifySloppyWithLocks(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* result_error);
+
+/**
  * Experimental: Mesh simplifier (pruner)
  * Reduces the number of triangles in the mesh by removing small isolated parts of the mesh
  * Returns the number of indices after simplification, with destination containing new index data
